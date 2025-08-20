@@ -104,7 +104,7 @@ class Message:
     def __init__(
         self,
         msg_type: MsgType,
-        lock_address: int,
+        device_address: int,
         ref_id: int,
         sequence_counter: int = 0,
         msg_data: bytes = b"",
@@ -117,7 +117,7 @@ class Message:
 
         Args:
             msg_type: The message type
-            lock_address: Lock address (4 bytes)
+            device_address: Device address (4 bytes)
             ref_id: Reference ID (int, bits 6-7 indicate type: 00=CMD/EVENT, 10=ANSWER)
             sequence_counter: Sequence counter value
             msg_data: Message data
@@ -126,7 +126,7 @@ class Message:
             is_card_reader_response: Whether bit 7 should be set in command byte
         """
         self.msg_type = msg_type
-        self.lock_address = lock_address
+        self.device_address = device_address
         self.sequence_counter = sequence_counter
         self.ref_id = ref_id & 0xFF  # Ensure it's within byte range
 
@@ -146,7 +146,7 @@ class Message:
         self.msg_byte = msg_type.value
         if is_card_reader_response:
             self.msg_byte |= 0x80  # Set bit 7
-        self.lock: Lock | None = None
+        self.lock: Lock = None  # type: ignore[assignment]
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "Message":
@@ -227,7 +227,7 @@ class Message:
             unused_byte,
             ref_id,
             sequence_counter,
-            lock_address,
+            device_address,
             msg_type_byte,
         ) = struct.unpack(">B B B B I I B", message_layer[:13])
 
@@ -273,7 +273,7 @@ class Message:
         # Build Message with decoded reference_id
         obj = cls(
             msg_type=msg_type,
-            lock_address=lock_address,
+            device_address=device_address,
             ref_id=ref_id,
             sequence_counter=sequence_counter,
             msg_data=msg_data,
@@ -291,7 +291,7 @@ class Message:
         Complete message as bytes including total length and CRC
         """
         # Build application layer (device address + msg type + msg data)
-        application_layer = struct.pack(">I B", self.lock_address, self.msg_byte)
+        application_layer = struct.pack(">I B", self.device_address, self.msg_byte)
         application_layer += self.msg_data
 
         # Build message layer (header + user_enc + unused + ref_id(byte) + sequence(uint32) + application layer)
@@ -372,7 +372,7 @@ class Message:
         return {
             "command": self.msg_type.name,
             "command_value": f"0x{self.msg_type.value:02X}",
-            "device_address": f"0x{self.lock_address:08X}",
+            "device_address": f"0x{self.device_address:08X}",
             "sequence_counter": self.sequence_counter,
             "reference_id": self.ref_id,
             "msg_data_length": len(self.msg_data),
@@ -388,7 +388,7 @@ class Message:
     def __repr__(self) -> str:
         """Detailed representation of the message."""
         return (
-            f"Message(msg_type={self.msg_type.name}, device_address=0x{self.lock_address:08X}, "
+            f"Message(msg_type={self.msg_type.name}, device_address=0x{self.device_address:08X}, "
             f"sequence_counter={self.sequence_counter}, reference_id={self.ref_id}, "
             f"msg_data={self.msg_data!r}, live_status={self.live_status!r}, "
             f"encrypted={self.encrypted}, is_card_reader_response={self.is_card_reader_response})"

@@ -11,3 +11,15 @@ class AddressMismatchError(SimonsVossError):
 
 class MsgDecodeError(SimonsVossError):
     """Exception raised when a message cannot be decoded."""
+
+
+class GatewayClientError(SimonsVossError):
+    """Base exception for gateway client errors."""
+
+
+class GatewayConnectionError(GatewayClientError):
+    """Raised when connection to gateway fails."""
+
+
+class AuthenticationError(GatewayClientError):
+    """Raised when AES authentication fails."""

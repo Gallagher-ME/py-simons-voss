@@ -4,15 +4,11 @@ Simons Voss Gateway Communication Library.
 This library provides TCP/IP communication capabilities for Simons Voss gateway.
 """
 
-from .client import (
-    ClientSocket,
-    GatewayClientError,
-    GatewayConnectionError,
-    AuthenticationError,
-)
+from .client import GatewayNode, GatewayConnectionError
+from .exceptions import AuthenticationError, GatewayClientError
 
 __all__ = [
-    "ClientSocket",
+    "GatewayNode",
     "GatewayClientError",
     "GatewayConnectionError",
     "AuthenticationError",

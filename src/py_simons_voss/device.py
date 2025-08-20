@@ -9,7 +9,6 @@ sequence counters, device addressing, and includes all available commands.
 from __future__ import annotations
 
 import logging
-import random
 import struct
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
@@ -17,7 +16,7 @@ from typing import TYPE_CHECKING, Optional
 from .message import Message, MsgType, ReferenceType, Response
 
 if TYPE_CHECKING:  # avoid runtime import cycles
-    from .client import ClientSocket
+    from .client import GatewayNode
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +70,12 @@ class Lock:
     ENCRYPTED = 0x01  # Encrypted flag
     UNUSED_BYTE = 0x00  # Unused byte (always 0x00)
 
-    def __init__(self, client: ClientSocket, address: int):
+    def __init__(self, client: GatewayNode, address: int):
         """
         Initialize the lock command builder.
 
         Args:
-            client: The ClientSocket used to send commands and route messages
+            client: The GatewayNode used to send commands and route messages
             address: The target device address (32-bit integer)
         """
         # Back-reference to a client for auto-sending commands and routing
@@ -101,42 +100,28 @@ class Lock:
         # Device will be registered with the client via client.add_lock() method
         self.response_timeout: float = 5.0
 
-    # --- Command helpers ---
-    def _gen_ref_id(self) -> int:
-        """Generate a command ref_id (6-bit value with bits 6-7 = 00)."""
-        return random.randint(1, 63)
-
     def _send_and_wait(
         self,
         command: MsgType,
         msg_data: bytes = b"",
         is_card_read_response: bool = False,
-        timeout: Optional[float] = None,
     ) -> Optional[Message]:
         """
         Send a command and wait for response using the client's command queue.
         This ensures only one command is processed at a time across all devices.
         """
-        rid = self._gen_ref_id()
-        timeout = timeout if timeout is not None else self.response_timeout
 
-        logger.debug("Sending command %s with ref_id=0x%02X", command.name, rid)
+        logger.debug("Sending command %s", command.name)
 
         # Use the client's send_and_wait method which handles queueing
         reply = self._client.send_and_wait(
             device_address=self.address,
             command=command,
-            ref_id=rid,
             msg_data=msg_data,
             is_card_reader_response=is_card_read_response,
-            timeout=timeout,
         )
 
-        logger.debug(
-            "Command completed for ref_id=0x%02X, got response: %s",
-            rid,
-            reply is not None,
-        )
+        logger.debug("Command completed, got response: %s", reply is not None)
         return reply
 
     def parse_message(self, msg: Message) -> None:
@@ -171,77 +156,68 @@ class Lock:
                 return True
         return False
 
-    # def get_system_info(self, timeout: Optional[float] = None) -> bytes:
+    # def get_system_info(self,) -> bytes:
     #     """Get system information and wait for response."""
     #     cmd_bytes, _ = self._send_and_wait(MsgType.GET_SYSTEM_INFO, timeout=timeout)
     #     return cmd_bytes
 
     def add_to_whitelist(
-        self, user_id: Optional[int] = None, timeout: Optional[float] = None
+        self,
+        user_id: Optional[int] = None,
     ) -> bool:
         """
         Add user to whitelist and wait for response.
         """
         msg_data = struct.pack(">I", user_id) if user_id is not None else b""
-        if reply := self._send_and_wait(
-            MsgType.ADD_TO_WHITELIST, msg_data, timeout=timeout
-        ):
+        if reply := self._send_and_wait(MsgType.ADD_TO_WHITELIST, msg_data):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
     def remove_from_whitelist(
-        self, user_id: Optional[int] = None, timeout: Optional[float] = None
+        self,
+        user_id: Optional[int] = None,
     ) -> bool:
         """
         Remove user from whitelist and wait for response.
         """
         msg_data = struct.pack(">I", user_id) if user_id is not None else b""
-        if reply := self._send_and_wait(
-            MsgType.REMOVE_FROM_WHITELIST, msg_data, timeout=timeout
-        ):
+        if reply := self._send_and_wait(MsgType.REMOVE_FROM_WHITELIST, msg_data):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def delete_whole_whitelist(self, timeout: Optional[float] = None) -> bool:
+    def delete_whole_whitelist(self) -> bool:
         """Delete entire whitelist and wait for response."""
-        if reply := self._send_and_wait(
-            MsgType.DELETE_WHOLE_WHITELIST, timeout=timeout
-        ):
+        if reply := self._send_and_wait(MsgType.DELETE_WHOLE_WHITELIST):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def deactivate_whitelist(self, timeout: Optional[float] = None) -> bool:
+    def deactivate_whitelist(self) -> bool:
         """Deactivate whitelist and wait for response."""
-        if reply := self._send_and_wait(MsgType.DEACTIVATE_WHITELIST, timeout=timeout):
+        if reply := self._send_and_wait(MsgType.DEACTIVATE_WHITELIST):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def activate_whitelist(self, timeout: Optional[float] = None) -> bool:
+    def activate_whitelist(self) -> bool:
         """Activate whitelist and wait for response."""
-        if reply := self._send_and_wait(MsgType.ACTIVATE_WHITELIST, timeout=timeout):
+        if reply := self._send_and_wait(MsgType.ACTIVATE_WHITELIST):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def access_denied(self, timeout: Optional[float] = None) -> bool:
+    def access_denied(self) -> bool:
         """Send access denied and wait for response."""
         if reply := self._send_and_wait(
-            MsgType.ACCESS_DENIED, is_card_read_response=True, timeout=timeout
+            MsgType.ACCESS_DENIED, is_card_read_response=True
         ):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def short_term_activation(
-        self,
-        card_read_response=False,
-        duration=0,
-        timeout: Optional[float] = None,
-    ) -> bool:
+    def short_term_activation(self, card_read_response=False, duration=0) -> bool:
         """
         Activate device for short term and wait for response.
         """
@@ -249,54 +225,50 @@ class Lock:
             raise ValueError("duration must be 0 or in range 10..250 (1/10 sec)")
         msg_data = struct.pack(">B", duration)
         if reply := self._send_and_wait(
-            MsgType.SHORT_TERM_ACTIVATION, msg_data, card_read_response, timeout
+            MsgType.SHORT_TERM_ACTIVATION, msg_data, card_read_response
         ):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def long_term_activation(
-        self, duration_hours: Optional[int] = None, timeout: Optional[float] = None
-    ) -> bool:
+    def long_term_activation(self, duration_hours: Optional[int] = None) -> bool:
         """
         Activate device for long term and wait for response.
         """
         msg_data = (
             struct.pack(">I", duration_hours) if duration_hours is not None else b""
         )
-        if reply := self._send_and_wait(
-            MsgType.LONG_TERM_ACTIVATION, msg_data, timeout=timeout
-        ):
+        if reply := self._send_and_wait(MsgType.LONG_TERM_ACTIVATION, msg_data):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def long_term_release(self, timeout: Optional[float] = None) -> bool:
+    def long_term_release(self) -> bool:
         """Release long term activation and wait for response."""
-        if reply := self._send_and_wait(MsgType.LONG_TERM_RELEASE, timeout=timeout):
+        if reply := self._send_and_wait(MsgType.LONG_TERM_RELEASE):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def office_mode_grant(self, timeout: Optional[float] = None) -> bool:
+    def office_mode_grant(self) -> bool:
         """Grant office mode and wait for response."""
-        if reply := self._send_and_wait(MsgType.OFFICE_MODE_GRANT, timeout=timeout):
+        if reply := self._send_and_wait(MsgType.OFFICE_MODE_GRANT):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def office_mode_release(self, timeout: Optional[float] = None) -> bool:
+    def office_mode_release(self) -> bool:
         """Release office mode and wait for response."""
-        if reply := self._send_and_wait(MsgType.OFFICE_MODE_RELEASE, timeout=timeout):
+        if reply := self._send_and_wait(MsgType.OFFICE_MODE_RELEASE):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def delete_whole_priority_whitelist(self, timeout: Optional[float] = None) -> bool:
+    def delete_whole_priority_whitelist(
+        self,
+    ) -> bool:
         """Delete entire priority whitelist and wait for response."""
-        if reply := self._send_and_wait(
-            MsgType.DELETE_WHOLE_PRIORITY_WHITELIST, timeout=timeout
-        ):
+        if reply := self._send_and_wait(MsgType.DELETE_WHOLE_PRIORITY_WHITELIST):
             resp = Response.from_message(reply)
             return resp.success
         return False

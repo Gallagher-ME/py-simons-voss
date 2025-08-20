@@ -5,20 +5,24 @@ This module provides a socket-based client class for communicating with a gatewa
 using TCP/IP protocol with optional AES encryption support and continuous background listening.
 """
 
+import logging
+import queue
+import random
 import socket
 import threading
 import time
-import logging
-import queue
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Union, Optional
 from dataclasses import dataclass
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-from Crypto.Random import get_random_bytes
-from .message import Message, MsgType, Response
-from .device import Lock
+from typing import Callable, Optional, Union
 
+from .device import Lock
+from .exceptions import GatewayConnectionError
+from .helpers import normalize_address
+
+# from Crypto.Cipher import AES
+# from Crypto.Util.Padding import pad, unpad
+# from Crypto.Random import get_random_bytes
+from .message import Message, MsgType, Response
 
 logger = logging.getLogger(__name__)
 
@@ -27,65 +31,58 @@ logger = logging.getLogger(__name__)
 class CommandRequest:
     """Represents a command request waiting to be sent."""
 
-    ref_id: int
     command: MsgType
     device_address: int
     msg_data: bytes
     is_card_reader_response: bool
     response_event: threading.Event
     response_message: Optional[Message] = None
+    ref_id: int = random.randint(1, 63)
 
 
-class GatewayClientError(Exception):
-    """Base exception for gateway client errors."""
-
-
-class GatewayConnectionError(GatewayClientError):
-    """Raised when connection to gateway fails."""
-
-
-class AuthenticationError(GatewayClientError):
-    """Raised when AES authentication fails."""
-
-
-class ClientSocket:
+class GatewayNode:
     """
     Socket-based TCP IP client with threaded listening for continuous monitoring.
 
     Usage:
-        client = ClientSocket(host, port, message_callback=on_message)
-        client.connect()  # Connect in main thread (blocks until connected or fails)
-        client.start_listening()  # Start background listener thread
-        client.send_command(command)  # Send from main thread anytime
-        client.stop()  # Stop listener and disconnect
+    gateway = GatewayNode(host, port, address, event_callback=on_message)
+    gateway.connect()  # Connect in main thread (blocks until connected or fails)
+    gateway.start_listening()  # Start background listener thread
+    gateway.send_command(command)  # Send from main thread anytime
+    gateway.stop()  # Stop listener and disconnect
     """
 
     def __init__(
         self,
         host: str,
         port: int,
+        address: int | str,
         aes_passphrase: str | None = None,
         auto_reconnect: bool = True,
         event_callback: Callable[[Message], None] | None = None,
     ):
         """
-        Initialize the socket gateway client.
+        Initialize a gateway node connection.
 
         Args:
             host: Gateway IP address
             port: Gateway port number
+            address: Gateway node address (e.g., 0x000100)
             aes_passphrase: Optional AES passphrase for encryption
             auto_reconnect: Whether to automatically reconnect on connection loss
             message_callback: Optional callback to receive fully decoded Message objects
         """
         self.host = host
         self.port = port
+        # normalize address
+        self.address = normalize_address(address)
         self.aes_passphrase = aes_passphrase
         self.auto_reconnect = auto_reconnect
         self.event_callback = event_callback
 
         self._socket: socket.socket | None = None
         self._connected = False
+        self._available = False
         self._listening = False
         self._stop_event = threading.Event()
         self._send_lock = threading.Lock()
@@ -107,6 +104,10 @@ class ClientSocket:
         self._callback_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="callback"
         )
+        # Default maximum time to wait for a device/gateway response per command
+        self.command_timeout_sec = 10.0
+        # Number of automatic retries after a timeout (total attempts = 1 + this value)
+        self.timeout_retry_count = 2
 
     @property
     def is_connected(self) -> bool:
@@ -114,9 +115,14 @@ class ClientSocket:
         return self._connected and self._socket is not None
 
     @property
-    def is_encrypted(self) -> bool:
-        """Check if communication is encrypted with AES."""
-        return self.aes_passphrase is not None
+    def available(self) -> bool:
+        """True only after a successful GET_STATUS reply from the gateway."""
+        return self._available
+
+    # @property
+    # def is_encrypted(self) -> bool:
+    #     """Check if communication is encrypted with AES."""
+    #     return self.aes_passphrase is not None
 
     # def _init_aes_cipher(self) -> None:
     #     """Initialize AES cipher with the provided passphrase."""
@@ -130,73 +136,104 @@ class ClientSocket:
 
     def connect(self) -> None:
         """
-        Connect to the gateway (runs in main thread).
-        This method blocks until connected or raises an exception.
+        Connect to the gateway with optional retries (runs in main thread).
+
+        Args:
+            retries: Number of retry attempts after the initial try (default 0)
+            retry_delay: Initial delay between retries in seconds (default 2.0)
+            backoff: Multiplier for exponential backoff (default 1.5)
         """
         if self._connected:
             logger.warning("Already connected to gateway")
             return
 
-        try:
-            # Create socket
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._socket.settimeout(10.0)
+        attempt = 0
+        delay = 2.0
+        retries = 3
 
-            # Connect to gateway
-            logger.debug("Connecting to %s:%s...", self.host, self.port)
-            self._socket.connect((self.host, self.port))
+        while attempt <= retries:
+            try:
+                # Create socket
+                self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._socket.settimeout(10.0)
 
-            # Set timeout for listening operations
-            self._socket.settimeout(1.0)
+                # Connect to gateway
+                logger.debug(
+                    "Connecting to %s:%s (attempt %d/%d)...",
+                    self.host,
+                    self.port,
+                    attempt + 1,
+                    retries + 1,
+                )
+                self._socket.connect((self.host, self.port))
 
-            self._connected = True
-            logger.info("✅ Connected to gateway at %s:%s", self.host, self.port)
+                # Set timeout for listening operations and mark socket connected
+                self._socket.settimeout(1.0)
+                self._connected = True
 
-        except socket.timeout as exc:
-            self._cleanup_connection()
-            raise GatewayConnectionError(
-                f"Connection timeout to {self.host}:{self.port}"
-            ) from exc
-        except socket.gaierror as exc:
-            # DNS/hostname resolution error
-            self._cleanup_connection()
-            raise GatewayConnectionError(
-                f"Could not resolve hostname {self.host}: {exc}"
-            ) from exc
-        except ConnectionRefusedError as exc:
-            # Connection refused (port closed/service not running)
-            self._cleanup_connection()
-            raise GatewayConnectionError(
-                f"Connection refused to {self.host}:{self.port} - service may not be running"
-            ) from exc
-        except OSError as exc:
-            # Network unreachable, invalid port, etc.
-            self._cleanup_connection()
-            raise GatewayConnectionError(
-                f"Network error connecting to {self.host}:{self.port}: {exc}"
-            ) from exc
-        except ValueError as exc:
-            # Invalid IP address format or port number
-            self._cleanup_connection()
-            raise GatewayConnectionError(
-                f"Invalid host/port format {self.host}:{self.port}: {exc}"
-            ) from exc
-        except Exception as e:
-            # Catch any other unexpected errors
-            self._cleanup_connection()
-            raise GatewayConnectionError(
-                f"Unexpected error connecting to {self.host}:{self.port}: {e}"
-            ) from e
-        self.start_listening()
+                # Start background threads before status check so we can receive replies
+                self.start_listening()
+
+                logger.info(
+                    "✅ Connected to gateway at %s:%s (addr=0x%06X) — probing availability",
+                    self.host,
+                    self.port,
+                    self.address,
+                )
+                # Probe availability without blocking connect for long; run in background
+                threading.Thread(
+                    target=self.get_status, name="InitialStatus", daemon=True
+                ).start()
+                return
+
+            except (OSError, ValueError) as e:
+                # Clean up any partial connection and decide to retry or raise
+                self._cleanup_connection()
+                attempt += 1
+                if attempt > retries:
+                    # Exhausted retries
+                    if isinstance(e, TimeoutError):
+                        raise GatewayConnectionError(
+                            f"Connection timeout to {self.host}:{self.port}"
+                        ) from e
+                    if isinstance(e, socket.gaierror):
+                        raise GatewayConnectionError(
+                            f"Could not resolve hostname {self.host}: {e}"
+                        ) from e
+                    if isinstance(e, ConnectionRefusedError):
+                        raise GatewayConnectionError(
+                            f"Connection refused to {self.host}:{self.port} - service may not be running"
+                        ) from e
+                    if isinstance(e, OSError):
+                        raise GatewayConnectionError(
+                            f"Network error connecting to {self.host}:{self.port}: {e}"
+                        ) from e
+                    if isinstance(e, ValueError):
+                        raise GatewayConnectionError(
+                            f"Invalid host/port format {self.host}:{self.port}: {e}"
+                        ) from e
+                else:
+                    logger.warning(
+                        "Connect attempt %d/%d failed: %s; retrying in %.1fs",
+                        attempt,
+                        retries + 1,
+                        e,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 1.5
+            except Exception as e:  # pylint: disable=broad-except
+                # Unexpected error: clean up and re-raise as gateway error
+                self._cleanup_connection()
+                raise GatewayConnectionError(
+                    f"Unexpected error connecting to {self.host}:{self.port}: {e}"
+                ) from e
 
     def start_listening(self) -> None:
         """
         Start the background listener thread.
         Must be called after connect().
         """
-        if not self._connected:
-            raise GatewayConnectionError("Must connect before starting listener")
-
         if self._listening:
             logger.warning("Listener thread is already running")
             return
@@ -244,7 +281,7 @@ class ClientSocket:
                     logger.warning("Command processor thread did not stop gracefully")
 
         # Shutdown the callback thread pool
-        self._callback_executor.shutdown(wait=True)
+        self._callback_executor.shutdown()
 
         # Close connection
         self._cleanup_connection()
@@ -253,6 +290,7 @@ class ClientSocket:
     def _cleanup_connection(self) -> None:
         """Clean up connection resources."""
         self._connected = False
+        self._available = False
 
         # Close socket
         if self._socket:
@@ -275,7 +313,7 @@ class ClientSocket:
                 # Try to receive data
                 try:
                     data = self._socket.recv(1024)
-                except socket.timeout:
+                except TimeoutError:
                     # Timeout is normal - just continue listening
                     continue
                 except socket.error as e:
@@ -283,14 +321,22 @@ class ClientSocket:
                         break
                     logger.error("Socket error in listener: %s", e)
                     if self.auto_reconnect:
+                        # Try to reconnect and keep the listener alive
                         self._handle_reconnect()
+                        if self._connected:
+                            # Successfully reconnected: continue listening
+                            continue
+                    # Either auto-reconnect is disabled or reconnection failed
                     break
 
                 if not data:
                     # Connection closed by gateway
                     logger.warning("📡 Connection closed by gateway")
                     if self.auto_reconnect:
+                        # Try to reconnect and continue listening if successful
                         self._handle_reconnect()
+                        if self._connected:
+                            continue
                     break
 
                 logger.debug(
@@ -300,7 +346,7 @@ class ClientSocket:
                 # Process the response
                 try:
                     self._handle_response(data)
-                except Exception as e:
+                except Exception as e:  # pylint: disable=broad-except
                     logger.error("Error handling response: %s", e)
 
             except Exception as e:  # pylint: disable=broad-except
@@ -325,7 +371,7 @@ class ClientSocket:
         if self._socket:
             try:
                 self._socket.close()
-            except Exception:
+            except OSError:
                 pass
             self._socket = None
 
@@ -344,74 +390,80 @@ class ClientSocket:
                 self._socket.settimeout(3.0)
                 self._socket.connect((self.host, self.port))
 
-                # Set timeout for listener
-                self._socket.settimeout(10.0)
+                # Set shorter timeout for listener loop polls (consistent with connect())
+                self._socket.settimeout(1.0)
+                # Mark socket connected and asynchronously refresh availability
                 self._connected = True
+                threading.Thread(
+                    target=self.get_status,
+                    name="PostReconnectStatus",
+                    daemon=True,
+                ).start()
                 logger.info("✅ Successfully reconnected to gateway")
                 return
 
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-except
                 logger.warning("Reconnection attempt %d failed: %s", attempt + 1, e)
                 retry_delay *= 1.5  # Exponential backoff
 
         logger.error("❌ Failed to reconnect after maximum attempts")
 
-    def _encrypt_data(self, data: bytes) -> bytes:
-        """
-        Encrypt data using AES encryption.
+    # def _encrypt_data(self, data: bytes) -> bytes:
+    #     """
+    #     Encrypt data using AES encryption.
 
-        Args:
-            data: Raw data to encrypt
+    #     Args:
+    #         data: Raw data to encrypt
 
-        Returns:
-            Encrypted data with IV prepended
-        """
-        if not self.aes_passphrase:
-            return data
+    #     Returns:
+    #         Encrypted data with IV prepended
+    #     """
+    #     if not self.aes_passphrase:
+    #         return data
 
-        try:
-            key = self.aes_passphrase.encode("utf-8")[:32].ljust(32, b"\0")
-            iv = get_random_bytes(16)  # AES block size
-            cipher = AES.new(key, AES.MODE_CBC, iv)
+    #     try:
+    #         key = self.aes_passphrase.encode("utf-8")[:32].ljust(32, b"\0")
+    #         iv = get_random_bytes(16)  # AES block size
+    #         cipher = AES.new(key, AES.MODE_CBC, iv)
 
-            # Pad data to multiple of 16 bytes
-            padded_data = pad(data, AES.block_size)
-            encrypted_data = cipher.encrypt(padded_data)
+    #         # Pad data to multiple of 16 bytes
+    #         padded_data = pad(data, AES.block_size)
+    #         encrypted_data = cipher.encrypt(padded_data)
 
-            # Prepend IV to encrypted data
-            return iv + encrypted_data
+    #         # Prepend IV to encrypted data
+    #         return iv + encrypted_data
 
-        except Exception as e:
-            raise AuthenticationError(f"Failed to encrypt data: {e}") from e
+    #     except Exception as e:  # pylint: disable=broad-except
+    #         raise AuthenticationError(f"Failed to encrypt data: {e}") from e
 
-    def _decrypt_data(self, data: bytes) -> bytes:
-        """
-        Decrypt AES encrypted data.
+    # def _decrypt_data(self, data: bytes) -> bytes:
+    #     """
+    #     Decrypt AES encrypted data.
 
-        Args:
-            data: Encrypted data with IV prepended
+    #     Args:
+    #         data: Encrypted data with IV prepended
 
-        Returns:
-            Decrypted raw data
-        """
-        if not self.aes_passphrase:
-            return data
+    #     Returns:
+    #         Decrypted raw data
+    #     """
+    #     if not self.aes_passphrase:
+    #         return data
 
-        try:
-            key = self.aes_passphrase.encode("utf-8")[:32].ljust(32, b"\0")
+    #     try:
+    #         key = self.aes_passphrase.encode("utf-8")[:32].ljust(32, b"\0")
 
-            # Extract IV and encrypted data
-            iv = data[:16]
-            encrypted_data = data[16:]
+    #         # Extract IV and encrypted data
+    #         iv = data[:16]
+    #         encrypted_data = data[16:]
 
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            decrypted_data = cipher.decrypt(encrypted_data)
+    #         cipher = AES.new(key, AES.MODE_CBC, iv)
+    #         decrypted_data = cipher.decrypt(encrypted_data)
 
-            # Remove padding
-            return unpad(decrypted_data, AES.block_size)
+    #         # Remove padding
+    #         return unpad(decrypted_data, AES.block_size)
 
-        except Exception as e:
-            raise AuthenticationError(f"Failed to decrypt data: {e}") from e
+    #     except Exception as e:  # pylint: disable=broad-except
+    #         raise AuthenticationError(f"Failed to decrypt data: {e}") from e
 
     def send_command(self, command: bytes) -> None:
         """
@@ -445,7 +497,7 @@ class ClientSocket:
             except socket.error as e:
                 logger.error("Send failed: %s", e)
                 raise GatewayConnectionError(f"Failed to send command: {e}") from e
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-except
                 raise GatewayConnectionError(f"Failed to send command: {e}") from e
 
     def _handle_response(self, data: bytes) -> None:
@@ -456,12 +508,13 @@ class ClientSocket:
             data: Raw response data from gateway
         """
         # Decrypt if AES is enabled
-        decrypted_data = self._decrypt_data(data)
+        # decrypted_data = self._decrypt_data(data)
+        decrypted_data = data
 
         # Decode and route a single complete message to registered devices
         try:
             msg = Message.from_bytes(decrypted_data)
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             logger.warning(
                 "Failed to decode message (%d bytes): %s", len(decrypted_data), e
             )
@@ -488,7 +541,7 @@ class ClientSocket:
                     self.resend_last_message(corrected_seq)
                     return  # Don't route to device for sequence mismatch responses
 
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-except
                 logger.error("Error handling RESPONSE: %s", e)
 
         # Check if this response matches the current command request
@@ -496,8 +549,9 @@ class ClientSocket:
             current_request = self._current_request
             if (
                 current_request
-                and current_request.device_address == msg.lock_address
-                and (current_request.ref_id & 0x3F) == (msg.ref_id & 0x3F)
+                and current_request.device_address == msg.device_address
+                and self._mask_ref_id(current_request.ref_id)
+                == self._mask_ref_id(msg.ref_id)
             ):
                 # This response is for the current command request
                 # Note: We mask with 0x3F because the gateway sets upper bits in responses
@@ -509,15 +563,24 @@ class ClientSocket:
                     msg.ref_id,
                 )
 
+        # If message is a direct gateway status check, update availability
+        if msg.device_address == self.address and msg.msg_type == MsgType.GET_STATUS:
+            self._available = True
+
         # Route to device for handling (state update and callback)
-        if not (lock := self.locks.get(msg.lock_address)):
-            logger.warning("No lock registered for address %08X", msg.lock_address)
+        lock = self.locks.get(msg.device_address)
+        if not lock:
+            # Don't warn if this was directed at the gateway node itself
+            if msg.device_address != self.address:
+                logger.warning(
+                    "No lock registered for address %08X", msg.device_address
+                )
             return
         try:
             msg.lock = lock
             lock.parse_message(msg)
-        except Exception as e:
-            logger.error("Device decode error for %08X: %s", msg.lock_address, e)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error("Device decode error for %08X: %s", msg.device_address, e)
 
         logger.debug("Handled response: %d bytes", len(decrypted_data))
 
@@ -525,7 +588,7 @@ class ClientSocket:
         """Execute a callback function asynchronously in the thread pool."""
         try:
             self._callback_executor.submit(callback, *args)
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             logger.error("Error submitting callback: %s", e)
 
     # Sequence counter management
@@ -598,16 +661,60 @@ class ClientSocket:
                     request.ref_id,
                 )
 
-                # Send the command
-                self._send_command_internal(request)
+                # Attempt send + wait with retries on timeout
+                max_attempts = 1 + int(self.timeout_retry_count)
+                attempt = 0
+                while attempt < max_attempts and not self._stop_event.is_set():
+                    attempt += 1
+                    # Send the command (may raise if not connected)
+                    try:
+                        logger.debug(
+                            "➡️  Attempt %d/%d for ref_id=0x%02X",
+                            attempt,
+                            max_attempts,
+                            request.ref_id,
+                        )
+                        self._send_command_internal(request)
+                    except GatewayConnectionError as e:
+                        # Abort all retries on socket/connection error; reconnection is handled elsewhere
+                        logger.warning(
+                            "Send failed due to connection error for ref_id=0x%02X: %s — aborting command retries",
+                            request.ref_id,
+                            e,
+                        )
+                        request.response_message = None
+                        request.response_event.set()
+                        break
 
-                # Wait for response or timeout
-                success = request.response_event.wait(timeout=5.0)  # 5 second timeout
-
-                if not success:
-                    logger.warning(
-                        "⏰ Command timeout for ref_id=0x%02X", request.ref_id
+                    # Wait for response or queue-level timeout
+                    success = request.response_event.wait(
+                        timeout=self.command_timeout_sec
                     )
+
+                    if success and request.response_message is not None:
+                        # Got a response; stop retry loop
+                        break
+
+                    # Timeout or event set without a response_message (shouldn't happen normally)
+                    if attempt < max_attempts:
+                        logger.warning(
+                            "⏰ Command timeout (attempt %d/%d) for ref_id=0x%02X — retrying",
+                            attempt,
+                            max_attempts,
+                            request.ref_id,
+                        )
+                        # Continue to next attempt
+                        continue
+                    logger.warning(
+                        "⏰ Command timeout (final attempt %d/%d) for ref_id=0x%02X — giving up",
+                        attempt,
+                        max_attempts,
+                        request.ref_id,
+                    )
+                    # Unblock any senders waiting on this request
+                    request.response_message = None
+                    request.response_event.set()
+                    break
 
                 # Clear current request
                 with self._queue_lock:
@@ -616,7 +723,7 @@ class ClientSocket:
                 # Mark task as done
                 self._command_queue.task_done()
 
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-except
                 logger.error("💥 Error in command processor: %s", e)
                 with self._queue_lock:
                     self._current_request = None
@@ -628,10 +735,12 @@ class ClientSocket:
         sequence_counter = self.get_next_sequence()
 
         # Create message instance
+        # Ensure command ref_id has type bits 6-7 = 00 (mask to 6-bit id)
+        cmd_ref_id = self._mask_ref_id(request.ref_id)
         message = Message(
             msg_type=request.command,
-            lock_address=request.device_address,
-            ref_id=request.ref_id,
+            device_address=request.device_address,
+            ref_id=cmd_ref_id,
             sequence_counter=sequence_counter,
             msg_data=request.msg_data,
             is_card_reader_response=request.is_card_reader_response,
@@ -651,18 +760,25 @@ class ClientSocket:
         self,
         device_address: int,
         command: MsgType,
-        ref_id: int,
         msg_data: bytes = b"",
         is_card_reader_response: bool = False,
-        timeout: float = 5.0,
     ) -> Optional[Message]:
         """
         Queue a command and wait for its response.
         This is the method that devices should call instead of sending directly.
         """
-        # Create command request
+        # Availability gating:
+        # - If targeting the gateway itself with GET_STATUS, allow regardless (used to establish availability)
+        # - For any device-targeted command (including device GET_STATUS), require availability
+        if device_address != self.address and not self.available:
+            logger.warning(
+                "Gateway not available yet; rejecting command %s to %08X",
+                command.name,
+                device_address,
+            )
+            return None
+
         request = CommandRequest(
-            ref_id=ref_id,
             command=command,
             device_address=device_address,
             msg_data=msg_data,
@@ -675,39 +791,35 @@ class ClientSocket:
             "📥 Queueing command %s for device %08X (ref_id=0x%02X)",
             command.name,
             device_address,
-            ref_id,
+            request.ref_id,
         )
         self._command_queue.put(request)
 
         # Wait for the command to be processed and response received
-        success = request.response_event.wait(timeout=timeout + 1.0)  # Add buffer time
+        request.response_event.wait()  # Add buffer time
 
-        if success and request.response_message:
-            logger.debug("✅ Got response for ref_id=0x%02X", ref_id)
+        if request.response_message:
+            logger.debug("✅ Got response for ref_id=0x%02X", request.ref_id)
             return request.response_message
-        else:
-            logger.warning(
-                "❌ No response received for ref_id=0x%02X within timeout", ref_id
-            )
-            return None
+        logger.warning(
+            "❌ No response received for ref_id=0x%02X within timeout",
+            request.ref_id,
+        )
+        return None
 
     # Device management
-    def add_lock(self, lock_address: Union[int, str]) -> Lock:
+    def add_lock(self, device_address: Union[int, str]) -> Lock:
         """
         Create and register a Lock device for the given address.
 
         Args:
-            lock_address: Device address as int or hex string
+            device_address: Device address as int or hex string
 
         Returns:
             The created Lock device instance
         """
         # Handle string addresses
-        if isinstance(lock_address, str):
-            if lock_address.startswith("0x"):
-                lock_address = int(lock_address, 16)
-            else:
-                lock_address = int(lock_address, 10)
+        lock_address = normalize_address(device_address)
 
         # Create the Lock device
         device = Lock(self, lock_address)
@@ -717,10 +829,27 @@ class ClientSocket:
 
         return device
 
-    def remove_lock(self, lock_address: int) -> None:
+    def remove_lock(self, device_address: int) -> None:
         """Unregister a lock by address."""
-        self.locks.pop(lock_address, None)
+        self.locks.pop(device_address, None)
 
-    def get_lock(self, lock_address: int) -> Lock | None:
+    def get_lock(self, device_address: int) -> Lock | None:
         """Retrieve a registered lock by address."""
-        return self.locks.get(lock_address)
+        return self.locks.get(device_address)
+
+    # --- Gateway self-commands ---
+
+    def get_status(self) -> bool:
+        """Query gateway node status via GET_STATUS; mark available on success."""
+        reply = self.send_and_wait(
+            device_address=self.address,
+            command=MsgType.GET_STATUS,
+        )
+        if reply and reply.msg_type == MsgType.GET_STATUS:
+            self._available = True
+        return self._available
+
+    @staticmethod
+    def _mask_ref_id(ref_id: int) -> int:
+        """Return the 6-bit command reference (bits 0-5)."""
+        return ref_id & 0x3F

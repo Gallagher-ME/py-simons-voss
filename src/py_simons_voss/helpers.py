@@ -1,9 +1,7 @@
 """Helper methods for Simons Voss gateway communication."""
 
-from typing import Union
 
-
-def normalize_address(address: Union[int, str]) -> int:
+def normalize_address(address: int | str) -> int:
     """
     Parse and validate a device address as a 4-byte unsigned integer.
 
@@ -41,3 +39,24 @@ def normalize_address(address: Union[int, str]) -> int:
         raise ValueError("Address must be 1..0xFFFFFFFE and fit in 4 bytes")
 
     return value
+
+
+def mask_ref_id(ref_id: int) -> int:
+    """Mask the reference ID to 6 bits."""
+    return ref_id & 0x3F
+
+
+def calculate_crc(data: bytes) -> int:
+    """Calculate CRC-16/CCITT checksum."""
+    POLYNOMIAL = 0x1021
+    INITIAL_VALUE = 0x0000
+
+    crc = INITIAL_VALUE
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ POLYNOMIAL
+            else:
+                crc <<= 1
+    return crc & 0xFFFF

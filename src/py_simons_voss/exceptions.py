@@ -23,3 +23,7 @@ class GatewayConnectionError(GatewayClientError):
 
 class AuthenticationError(GatewayClientError):
     """Raised when AES authentication fails."""
+
+
+class GatewayNotAvailable(GatewayClientError):
+    """Raised when the gateway does not respond to GET_STATUS during connect()."""

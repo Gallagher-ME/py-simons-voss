@@ -1,6 +1,6 @@
 [project]
 name = "py-simons-voss"
-version = "0.1.0"
+version = "0.1.0b0"
 description = "Python library for SimonsVoss Gateway"
 authors = [{ name = "Rami Mousleh", email = "engrbm87@gmail.com" }]
 readme = "README.md"

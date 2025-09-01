@@ -1,0 +1,35 @@
+name: Build Python artifacts
+description: Builds Python distributions with uv.
+inputs:
+  python-version:
+    description: Python version to use
+    required: false
+    default: "3.11"
+outputs:
+  version:
+    description: Project version from pyproject.toml
+    value: ${{ steps.get_version.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Python (uv)
+      uses: astral-sh/setup-uv@v3
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Build sdist + wheel
+      shell: bash
+      run: |
+        uv build --sdist --wheel
+
+    - name: List dist
+      shell: bash
+      run: ls -l dist || { echo '::error::dist directory missing'; exit 1; }
+
+    - name: Get version
+      id: get_version
+      shell: bash
+      run: |
+        VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "Project version: $VERSION"

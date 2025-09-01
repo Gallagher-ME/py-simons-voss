@@ -1,0 +1,33 @@
+name: Pre-Release Build
+
+on:
+  release:
+    types: [prereleased]
+
+permissions:
+  contents: write # needed to upload assets to the release
+  id-token: write
+
+jobs:
+  build-pre-release:
+    name: Build wheel for prerelease
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build artifacts (sdist + wheel)
+        id: build
+        uses: ./.github/actions/build-artifacts
+        with:
+          python-version: "3.11"
+      - name: Upload wheel to release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "Uploaded wheel(s) for prerelease version ${{ steps.build.outputs.version }}." >> $GITHUB_STEP_SUMMARY

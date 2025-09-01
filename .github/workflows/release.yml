@@ -1,0 +1,42 @@
+name: Publish Release
+
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-publish:
+    name: Build & Publish to PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build artifacts (sdist + wheel)
+        id: build
+        uses: ./.github/actions/build-artifacts
+        with:
+          python-version: "3.11"
+      - name: Verify tag matches version
+        id: verify
+        shell: bash
+        run: |
+          if [ "${{ steps.build.outcome }}" != "success" ]; then
+            echo "::error::Build composite action failed."; exit 1; fi
+          TAG_NAME="${GITHUB_REF_NAME}"
+          TAG_STRIPPED=${TAG_NAME#v}
+          # Extract version using python -c to avoid multiline heredoc parsing issues
+          VERSION="${{ steps.build.outputs.version }}"
+          echo "Version in pyproject.toml: $VERSION"
+          if [ "$TAG_STRIPPED" != "$VERSION" ]; then
+            echo "::error::Tag ($TAG_NAME) does not match project version ($VERSION)."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Publish to PyPI with uv (trusted publisher)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          uv publish dist/*

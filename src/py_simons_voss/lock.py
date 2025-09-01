@@ -11,12 +11,12 @@ from __future__ import annotations
 import logging
 import struct
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any
 
-from .message import Message, MsgType, ReferenceType, Response
+from .message import Message, MsgType, Response, ResponseCode
 
-if TYPE_CHECKING:  # avoid runtime import cycles
-    from .client import GatewayNode
+if TYPE_CHECKING:
+    from .gateway import GatewayNode
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +42,8 @@ class QosLevel(Enum):
 class LockState(Enum):
     """Lock states based on live status bits"""
 
-    LOCKED = 0
-    UNLOCKED = 1
+    NOT_ENGAGED = 0
+    ENGAGED = 1
 
 
 class Lock:
@@ -63,14 +63,7 @@ class Lock:
         # Send command_data through your socket connection
     """
 
-    # Protocol constants for new message structure
-    ACP_IDENTIFIER = 0xFEFD  # Fixed ACP Identifier
-    HEADER_VERSION = 0x01  # Header version (always 0x01)
-    UNENCRYPTED = 0x00  # Unencrypted flag
-    ENCRYPTED = 0x01  # Encrypted flag
-    UNUSED_BYTE = 0x00  # Unused byte (always 0x00)
-
-    def __init__(self, client: GatewayNode, address: int):
+    def __init__(self, client: GatewayNode, address: int) -> None:
         """
         Initialize the lock command builder.
 
@@ -84,7 +77,6 @@ class Lock:
 
         # Last received decoded message for this device (if any)
         self.last_message: Message | None = None
-        self.last_command_successful = False
 
         # Live status derived fields (updated when live_status is received)
         self.battery_status = BatteryStatus.UNKNOWN
@@ -92,67 +84,31 @@ class Lock:
         self.lock_state: LockState | None = None
         self.lock_tampered = False
 
-        logger.debug(
-            "Initialized device %08X",
-            address,
-        )
+        logger.debug("Initialized device %08X", address)
 
-        # Device will be registered with the client via client.add_lock() method
-        self.response_timeout: float = 5.0
-
-    def _send_and_wait(
+    async def _send_and_wait(
         self,
         command: MsgType,
         msg_data: bytes = b"",
         is_card_read_response: bool = False,
-    ) -> Optional[Message]:
-        """
-        Send a command and wait for response using the client's command queue.
-        This ensures only one command is processed at a time across all devices.
-        """
-
+    ) -> Message | None:
+        """Async: queue a command and await its response via the client's queue."""
         logger.debug("Sending command %s", command.name)
-
-        # Use the client's send_and_wait method which handles queueing
-        reply = self._client.send_and_wait(
+        reply = await self._client.send_and_wait(
             device_address=self.address,
             command=command,
             msg_data=msg_data,
             is_card_reader_response=is_card_read_response,
         )
-
         logger.debug("Command completed, got response: %s", reply is not None)
         return reply
 
-    def parse_message(self, msg: Message) -> None:
-        """
-        Handle a received Message object:
-        - Update live_status for event messages.
-        - Forward CMD_EVENT messages to event_callback if set.
-
-        Note: Response handling and sequence mismatch is now done at the client level.
-        """
-        # Store the received message for potential data extraction
-        self.last_message = msg
-
-        # Update live status if present (events carry live status here)
-        if msg.live_status:
-            self._update_from_live_status(msg.live_status)
-
-        # Notify client's event callback for CMD_EVENT messages
-        if (
-            msg.ref_id_type == ReferenceType.CMD_EVENT
-            and self._client.event_callback is not None
-        ):
-            # Execute callback asynchronously to prevent blocking the listener thread
-            self._client.execute_callback_async(self._client.event_callback, msg)
-
-    def get_status(self) -> bool:
-        """Get device status. Wait for GET_STATUS reply and update live status from its data."""
-        reply = self._send_and_wait(MsgType.GET_STATUS)
+    async def get_status(self) -> bool:
+        """Async: Get device status and update live status from the reply."""
+        reply = await self._send_and_wait(MsgType.GET_STATUS)
         if reply and reply.msg_type == MsgType.GET_STATUS and reply.msg_data:
             if len(reply.msg_data) >= 5:
-                self._update_from_live_status(reply.msg_data[:5])
+                self.update_status(reply.msg_data[:5])
                 return True
         return False
 
@@ -161,114 +117,129 @@ class Lock:
     #     cmd_bytes, _ = self._send_and_wait(MsgType.GET_SYSTEM_INFO, timeout=timeout)
     #     return cmd_bytes
 
-    def add_to_whitelist(
-        self,
-        user_id: Optional[int] = None,
-    ) -> bool:
+    async def add_to_whitelist(self, user_id: int | None = None) -> bool:
         """
-        Add user to whitelist and wait for response.
+        Async: Add user to whitelist and wait for response.
         """
         msg_data = struct.pack(">I", user_id) if user_id is not None else b""
-        if reply := self._send_and_wait(MsgType.ADD_TO_WHITELIST, msg_data):
+        if reply := await self._send_and_wait(MsgType.ADD_TO_WHITELIST, msg_data):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def remove_from_whitelist(
-        self,
-        user_id: Optional[int] = None,
-    ) -> bool:
+    async def remove_from_whitelist(self, user_id: int | None = None) -> bool:
         """
-        Remove user from whitelist and wait for response.
+        Async: Remove user from whitelist and wait for response.
         """
         msg_data = struct.pack(">I", user_id) if user_id is not None else b""
-        if reply := self._send_and_wait(MsgType.REMOVE_FROM_WHITELIST, msg_data):
+        if reply := await self._send_and_wait(MsgType.REMOVE_FROM_WHITELIST, msg_data):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def delete_whole_whitelist(self) -> bool:
-        """Delete entire whitelist and wait for response."""
-        if reply := self._send_and_wait(MsgType.DELETE_WHOLE_WHITELIST):
+    async def delete_whole_whitelist(self) -> bool:
+        """Async: Delete entire whitelist and wait for response."""
+        if reply := await self._send_and_wait(MsgType.DELETE_WHOLE_WHITELIST):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def deactivate_whitelist(self) -> bool:
-        """Deactivate whitelist and wait for response."""
-        if reply := self._send_and_wait(MsgType.DEACTIVATE_WHITELIST):
+    async def deactivate_whitelist(self) -> bool:
+        """Async: Deactivate whitelist and wait for response."""
+        if reply := await self._send_and_wait(MsgType.DEACTIVATE_WHITELIST):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def activate_whitelist(self) -> bool:
-        """Activate whitelist and wait for response."""
-        if reply := self._send_and_wait(MsgType.ACTIVATE_WHITELIST):
+    async def activate_whitelist(self) -> bool:
+        """Async: Activate whitelist and wait for response."""
+        if reply := await self._send_and_wait(MsgType.ACTIVATE_WHITELIST):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def access_denied(self) -> bool:
-        """Send access denied and wait for response."""
-        if reply := self._send_and_wait(
+    async def access_denied(self) -> bool:
+        """Async: Send access denied and wait for response."""
+        if reply := await self._send_and_wait(
             MsgType.ACCESS_DENIED, is_card_read_response=True
         ):
             resp = Response.from_message(reply)
+            if resp.code is ResponseCode.UNEXPECTED:
+                logger.warning("Access denied message was not expected by the lock.")
             return resp.success
         return False
 
-    def short_term_activation(self, card_read_response=False, duration=0) -> bool:
-        """
-        Activate device for short term and wait for response.
-        """
+    async def activate_shortly(self, duration=0, card_read_response=False) -> bool:
+        """Async: Activate device for short term and wait for response."""
+        if self.lock_state == LockState.ENGAGED:
+            logger.warning("Lock is already engaged, cannot short term activate")
+            return False
         if duration != 0 and not 10 <= duration <= 250:
             raise ValueError("duration must be 0 or in range 10..250 (1/10 sec)")
         msg_data = struct.pack(">B", duration)
-        if reply := self._send_and_wait(
+        if reply := await self._send_and_wait(
             MsgType.SHORT_TERM_ACTIVATION, msg_data, card_read_response
         ):
             resp = Response.from_message(reply)
+            if resp.success:
+                await self.get_status()
             return resp.success
         return False
 
-    def long_term_activation(self, duration_hours: Optional[int] = None) -> bool:
-        """
-        Activate device for long term and wait for response.
-        """
-        msg_data = (
-            struct.pack(">I", duration_hours) if duration_hours is not None else b""
-        )
-        if reply := self._send_and_wait(MsgType.LONG_TERM_ACTIVATION, msg_data):
+    async def activate_long(
+        self, delay: int = 0, duration: int = 0, card_read_response=False
+    ) -> bool:
+        """Async: Activate device for long term and wait for response."""
+        if self.lock_state == LockState.ENGAGED:
+            logger.warning("Lock is already engaged, cannot long term activate")
+            return False
+        if delay > 1440:
+            raise ValueError("delay must be in range 0..1440 (minutes)")
+        if duration > 1440:
+            raise ValueError("duration must be in range 0..1440 (minutes)")
+        msg_data = struct.pack(">HH", delay, duration)
+        if reply := await self._send_and_wait(
+            MsgType.LONG_TERM_ACTIVATION, msg_data, card_read_response
+        ):
+            resp = Response.from_message(reply)
+            if resp.code is ResponseCode.UNEXPECTED:
+                logger.warning(
+                    "Long term activation failed, lock is already activated or a card read response was expected."
+                )
+            if resp.success:
+                await self.get_status()
+            return resp.success
+        return False
+
+    async def long_term_release(self, delay: int = 0) -> bool:
+        """Async: Release long term activation and wait for response."""
+        msg_data = struct.pack(">H", delay)
+        if reply := await self._send_and_wait(MsgType.LONG_TERM_RELEASE, msg_data):
+            resp = Response.from_message(reply)
+            if resp.code is ResponseCode.UNEXPECTED:
+                logger.warning("Long term release failed, lock is already released")
+            return resp.success
+        return False
+
+    async def office_mode_grant(self) -> bool:
+        """Async: Grant office mode and wait for response."""
+        if reply := await self._send_and_wait(MsgType.OFFICE_MODE_GRANT):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def long_term_release(self) -> bool:
-        """Release long term activation and wait for response."""
-        if reply := self._send_and_wait(MsgType.LONG_TERM_RELEASE):
+    async def office_mode_release(self) -> bool:
+        """Async: Release office mode and wait for response."""
+        if reply := await self._send_and_wait(MsgType.OFFICE_MODE_RELEASE):
             resp = Response.from_message(reply)
             return resp.success
         return False
 
-    def office_mode_grant(self) -> bool:
-        """Grant office mode and wait for response."""
-        if reply := self._send_and_wait(MsgType.OFFICE_MODE_GRANT):
-            resp = Response.from_message(reply)
-            return resp.success
-        return False
-
-    def office_mode_release(self) -> bool:
-        """Release office mode and wait for response."""
-        if reply := self._send_and_wait(MsgType.OFFICE_MODE_RELEASE):
-            resp = Response.from_message(reply)
-            return resp.success
-        return False
-
-    def delete_whole_priority_whitelist(
+    async def delete_whole_priority_whitelist(
         self,
     ) -> bool:
-        """Delete entire priority whitelist and wait for response."""
-        if reply := self._send_and_wait(MsgType.DELETE_WHOLE_PRIORITY_WHITELIST):
+        """Async: Delete entire priority whitelist and wait for response."""
+        if reply := await self._send_and_wait(MsgType.DELETE_WHOLE_PRIORITY_WHITELIST):
             resp = Response.from_message(reply)
             return resp.success
         return False
@@ -276,22 +247,15 @@ class Lock:
     @property
     def device_info(self) -> dict:
         """Get current device configuration."""
-        info = {
-            "device_address": f"{self.address:08X}",
-        }
+        info: dict[str, Any] = {"device_address": f"{self.address:08X}"}
         if self.battery_status is not None:
             info["battery_status"] = self.battery_status.name
         if self.qos_level is not None:
             info["qos_level"] = self.qos_level.name
+        if self.lock_state is not None:
+            info["lock_state"] = self.lock_state.name
+        info["lock_tampered"] = self.lock_tampered
         return info
-
-    def get_last_message(self) -> Message | None:
-        """Return the last received message for this device, if any."""
-        return self.last_message
-
-    def clear_last_message(self) -> None:
-        """Clear the stored last message."""
-        self.last_message = None
 
     def get_last_card_data(self) -> str | None:
         """Return the card data (hex) from the last READER_EVENT, if available."""
@@ -302,7 +266,7 @@ class Lock:
             return None
         return None
 
-    def _update_from_live_status(self, live_status: bytes) -> None:
+    def update_status(self, live_status: bytes) -> None:
         """Parse 5-byte live status and update battery_status and qos_level.
 
         We only use the lowest 4 bits of the first live_status byte:

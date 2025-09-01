@@ -9,11 +9,14 @@ This module defines:
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from .helpers import calculate_crc
+
 if TYPE_CHECKING:
-    from .device import Lock
+    from .lock import Lock
 
 
 class MsgType(Enum):
@@ -50,20 +53,12 @@ class MsgType(Enum):
             cls.CARD_READER_STATE_EVENT,
         ]
 
-    @classmethod
-    def from_value(cls, value):
-        """Find MsgType by value."""
-        for msg_type in cls:
-            if msg_type.value == value:
-                return msg_type
-        raise ValueError(f"Unknown message type: {value:02X}")
-
 
 class ReferenceType(Enum):
     """Reference type for messages."""
 
-    CMD_EVENT = 0x00
-    ANSWER = 0x10
+    CMD_EVENT = 0
+    ANSWER = 2
 
 
 class Message:
@@ -100,14 +95,17 @@ class Message:
     ENCRYPTED = 0x01
     UNUSED_BYTE = 0x00
     LIVE_STATUS_LENGTH = 5
+    LENGTH_BYTE = 1
+    CRC_BYTES = 2
 
     def __init__(
         self,
+        *,
         msg_type: MsgType,
         device_address: int,
         ref_id: int,
+        msg_data: bytes,
         sequence_counter: int = 0,
-        msg_data: bytes = b"",
         live_status: bytes = b"",
         encrypted: bool = False,
         is_card_reader_response: bool = False,
@@ -125,17 +123,14 @@ class Message:
             encrypted: Whether the message is encrypted
             is_card_reader_response: Whether bit 7 should be set in command byte
         """
+        self.lock: Lock = None  # type: ignore[assignment]
         self.msg_type = msg_type
         self.device_address = device_address
         self.sequence_counter = sequence_counter
-        self.ref_id = ref_id & 0xFF  # Ensure it's within byte range
 
+        self.ref_id = ref_id & 0xFF  # Ensure it's within byte range
         # Derive type from bits 6-7 (00=CMD/EVENT, 10=ANSWER). Map unknown to CMD_EVENT
-        type_bits = (self.ref_id >> 6) & 0x03
-        if type_bits == 0x02:
-            self.ref_id_type = ReferenceType.ANSWER
-        else:
-            self.ref_id_type = ReferenceType.CMD_EVENT
+        self.ref_id_type = ReferenceType((self.ref_id >> 6) & 0x03)
 
         self.msg_data = msg_data
         self.live_status = live_status
@@ -143,13 +138,13 @@ class Message:
         self.is_card_reader_response = is_card_reader_response
 
         # Calculate derived values
-        self.msg_byte = msg_type.value
+        self.msg_type_byte: int = msg_type.value
         if is_card_reader_response:
-            self.msg_byte |= 0x80  # Set bit 7
-        self.lock: Lock = None  # type: ignore[assignment]
+            self.msg_type_byte |= 0x80  # Set bit 7
+        self.msg_byte: bytes | None = None
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "Message":
+    def from_bytes(cls, data: bytes) -> Message:
         """
         Decode a message from bytes.
 
@@ -209,7 +204,7 @@ class Message:
         received_crc = struct.unpack(
             ">H", data[message_layer_end : message_layer_end + 2]
         )[0]
-        calculated_crc = cls._calculate_crc16_ccitt(message_without_crc)
+        calculated_crc = calculate_crc(message_without_crc)
 
         if received_crc != calculated_crc:
             raise ValueError(
@@ -224,7 +219,7 @@ class Message:
         (
             header_version,
             user_enc,
-            unused_byte,
+            _unused_byte,
             ref_id,
             sequence_counter,
             device_address,
@@ -237,13 +232,8 @@ class Message:
                 f"Invalid header version: expected {cls.HEADER_VERSION}, got {header_version}"
             )
 
-        if unused_byte != cls.UNUSED_BYTE:
-            raise ValueError(
-                f"Invalid unused byte: expected {cls.UNUSED_BYTE}, got {unused_byte}"
-            )
-
         # Find matching msg_type
-        msg_type = MsgType.from_value(msg_type_byte)
+        msg_type = MsgType(msg_type_byte)
 
         # Extract message data; live_status handled for events only here
         remaining_data = message_layer[13:]
@@ -291,7 +281,7 @@ class Message:
         Complete message as bytes including total length and CRC
         """
         # Build application layer (device address + msg type + msg data)
-        application_layer = struct.pack(">I B", self.device_address, self.msg_byte)
+        application_layer = struct.pack(">I B", self.device_address, self.msg_type_byte)
         application_layer += self.msg_data
 
         # Build message layer (header + user_enc + unused + ref_id(byte) + sequence(uint32) + application layer)
@@ -315,56 +305,20 @@ class Message:
         )
 
         # Add total length byte
-        total_length = len(message_without_total_length) + 1 + 2
+        total_length = (
+            len(message_without_total_length) + self.LENGTH_BYTE + self.CRC_BYTES
+        )
         message_with_total_length = (
             struct.pack(">B", total_length) + message_without_total_length
         )
 
         # Add CRC
-        message_with_crc = self._add_crc16_ccitt(message_with_total_length)
-        return message_with_crc
+        crc = calculate_crc(message_with_total_length)
+        return message_with_total_length + struct.pack(">H", crc)
 
-    def to_hex(self, separator: str = " ") -> str:
-        """
-        Convert message to hex string.
-
-        Args:
-            separator: Separator between hex bytes (default: space)
-
-        Returns:
-            Hex string representation
-        """
-        hex_bytes = self.to_bytes().hex().upper()
-        if separator and len(separator) == 1:
-            # Insert separator between each pair of hex characters
-            return separator.join(
-                hex_bytes[i : i + 2] for i in range(0, len(hex_bytes), 2)
-            )
-        else:
-            # No separator or invalid separator
-            return hex_bytes
-
-    @staticmethod
-    def _calculate_crc16_ccitt(data: bytes) -> int:
-        """Calculate CRC-16/CCITT checksum."""
-        POLYNOMIAL = 0x1021
-        INITIAL_VALUE = 0x0000
-
-        crc = INITIAL_VALUE
-        for byte in data:
-            crc ^= byte << 8
-            for _ in range(8):
-                if crc & 0x8000:
-                    crc = (crc << 1) ^ POLYNOMIAL
-                else:
-                    crc <<= 1
-        return crc & 0xFFFF
-
-    @staticmethod
-    def _add_crc16_ccitt(data: bytes) -> bytes:
-        """Add CRC-16/CCITT checksum to data."""
-        crc = Message._calculate_crc16_ccitt(data)
-        return data + struct.pack(">H", crc)
+    def __str__(self) -> str:
+        """Represent message as hex string."""
+        return self.to_bytes().hex(" ").upper()
 
     @property
     def info(self) -> dict:
@@ -428,18 +382,17 @@ class Message:
         return card_data.hex().upper()
 
 
-__all__ = ["MsgType", "Message"]
-
-
 class ResponseCode(int, Enum):
     """Known response codes for MsgType.RESPONSE payloads."""
 
     SUCCESS = 0x00
-    FAILURE = 0x0A
+    FAILED = 0x01
+    UNEXPECTED = 0x0A
     SEQUENCE_MISMATCH = 0x07
     # Other codes can be added here as they are discovered
 
 
+@dataclass
 class Response:
     """
     Parser/helper for MsgType.RESPONSE payloads.
@@ -452,9 +405,13 @@ class Response:
       - data[0:4]: current sequence (big-endian uint32)
     """
 
-    def __init__(self, code: int, data: bytes):
-        self.code = code
-        self.data = data
+    code: ResponseCode
+    data: int
+
+    @property
+    def success(self) -> bool:
+        """Check if the response indicates success."""
+        return self.code == ResponseCode.SUCCESS
 
     @classmethod
     def from_message(cls, msg: Message) -> Response:
@@ -464,20 +421,7 @@ class Response:
         payload = msg.msg_data or b""
         if len(payload) < 1:
             raise ValueError("RESPONSE payload too short")
-        code = payload[0]
-        data = payload[1:]
-        return cls(code=code, data=data)
-
-    @property
-    def success(self) -> bool:
-        """Return True if the response indicates success."""
-        return self.code == ResponseCode.SUCCESS
-
-    @property
-    def sequence_mismatch(self) -> bool:
-        """Return True if the response indicates a sequence mismatch."""
-        return self.code == ResponseCode.SEQUENCE_MISMATCH
-
-
-# Ensure Response types are exported
-__all__ = ["MsgType", "Message", "Response", "ResponseCode"]
+        return cls(
+            code=ResponseCode(payload[0]),
+            data=int.from_bytes(payload[1:], byteorder="big"),
+        )

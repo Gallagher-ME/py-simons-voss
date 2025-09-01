@@ -1,6 +1,6 @@
 [project]
 name = "py-simons-voss"
-version = "0.1.0"
+version = "0.1.0b0"
 description = "Python library for SimonsVoss Gateway"
 authors = [{ name = "Rami Mousleh", email = "engrbm87@gmail.com" }]
 readme = "README.md"
@@ -12,8 +12,8 @@ packages = [{ include = "py_simons_voss", from = "src" }]
 
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["uv-build>=0.8.13"]
+build-backend = "uv_build"
 
 [tool.pylint."MESSAGES CONTROL"]
 disable = [
@@ -28,3 +28,6 @@ disable = [
     "redefined-builtin",             # A001
     "protected-access",              # SLF001
 ]
+
+[tool.ruff]
+required-version = ">=0.8.0"

@@ -40,7 +40,7 @@ wheels = [
 
 [[package]]
 name = "py-simons-voss"
-version = "0.1.0b0"
+version = "0.1.0b1"
 source = { editable = "." }
 dependencies = [
     { name = "pycryptodome" },

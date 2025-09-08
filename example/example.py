@@ -97,6 +97,8 @@ async def main_async() -> int:
         await client.connect()
         print("Connected. Probing availability and listening for messages...")
         await device1.get_status()
+        # await device1.long_term_release()
+        # await device1.activate_long(duration=1200)
         print("Listening for events continuously. Press Ctrl+C to quit.")
         try:
             while True:

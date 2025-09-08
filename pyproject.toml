@@ -7,9 +7,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["pycryptodome>=3.19.0"]
 
-[tool.poetry]
-packages = [{ include = "py_simons_voss", from = "src" }]
-
 
 [build-system]
 requires = ["uv-build>=0.8.13"]

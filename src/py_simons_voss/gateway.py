@@ -120,32 +120,31 @@ class GatewayNode:
                     )
                     self._connected = True
 
-                    # Clear stop flag and start tasks
-                    self._stop_event.clear()
-                    listener_task = self._loop.create_task(
-                        self._listen_for_responses(), name="SocketListenerAsync"
-                    )
-                    self._tasks.add(listener_task)
-                    listener_task.add_done_callback(self._tasks.remove)
-
-                    processor_task = self._loop.create_task(
-                        self._process_commands(), name="CommandProcessorAsync"
-                    )
-                    self._tasks.add(processor_task)
-                    processor_task.add_done_callback(self._tasks.remove)
-
                     logger.info(
-                        "✅ Connected to gateway at %s:%s (addr=0x%06X) — checking availability",
+                        "Connected to gateway at %s:%s (addr=0x%06X) — checking availability",
                         self.host,
                         self.port,
                         self.address,
                     )
+                    if not self._tasks:
+                        # Clear stop flag and start tasks
+                        self._stop_event.clear()
+                        listener_task = self._loop.create_task(
+                            self._listen_for_responses(), name="SocketListenerAsync"
+                        )
+                        self._tasks.add(listener_task)
+                        listener_task.add_done_callback(self._tasks.remove)
+
+                        processor_task = self._loop.create_task(
+                            self._process_commands(), name="CommandProcessorAsync"
+                        )
+                        self._tasks.add(processor_task)
+                        processor_task.add_done_callback(self._tasks.remove)
                     # Probe availability synchronously; if it fails, raise
                     if not await self.get_status():
                         raise GatewayNotAvailable(
                             "Gateway did not respond to GET_STATUS during connect"
                         )
-                    self._available = True
                     return
 
                 except (asyncio.TimeoutError, OSError) as e:
@@ -178,8 +177,15 @@ class GatewayNode:
         """Stop tasks and close the connection."""
         logger.debug("Disconnecting from gateway...")
         self._stop_event.set()
+
+        # Cancel & await all registered tasks
+        if self._tasks:
+            _, pending = await asyncio.wait([*self._tasks], timeout=10)
+            for task in pending:
+                task.cancel()
+
         await self._cleanup_connection()
-        logger.debug("✅ Disconnected from gateway")
+        logger.debug("Disconnected from gateway")
 
     # ========= Public command & device API =========
     async def send_and_wait(
@@ -212,7 +218,7 @@ class GatewayNode:
         )
         request = MessageRequest(message=message, response_event=asyncio.Event())
         logger.debug(
-            "📥 Queueing command %s for device %08X (ref_id=0x%02X)",
+            "Queueing command %s for device %08X (ref_id=0x%02X)",
             command.name,
             device_address,
             request.message.ref_id,
@@ -220,10 +226,10 @@ class GatewayNode:
         await self._command_queue.put(request)
         await request.response_event.wait()
         if request.response_message:
-            logger.debug("✅ Got response for ref_id=0x%02X", request.message.ref_id)
+            logger.debug("Got response for ref_id=0x%02X", request.message.ref_id)
             return request.response_message
         logger.warning(
-            "❌ No response received for ref_id=0x%02X within timeout",
+            "No response received for ref_id=0x%02X within timeout",
             request.message.ref_id,
         )
         return None
@@ -231,17 +237,8 @@ class GatewayNode:
     def add_lock(self, device_address: Union[int, str]) -> Lock:
         """Register a lock on this gateway and return it."""
         lock_address = normalize_address(device_address)
-        device = Lock(self, lock_address)  # type: ignore[arg-type]
-        self.locks[lock_address] = device
-        return device
-
-    def remove_lock(self, device_address: int) -> None:
-        """Unregister a lock from this gateway."""
-        self.locks.pop(device_address, None)
-
-    def get_lock(self, device_address: int) -> Lock | None:
-        """Return a registered lock or None."""
-        return self.locks.get(device_address)
+        self.locks[lock_address] = lock = Lock(self, lock_address)
+        return lock
 
     async def get_status(self) -> bool:
         """Query the gateway's own status (GET_STATUS)."""
@@ -249,20 +246,18 @@ class GatewayNode:
             device_address=self.address,
             command=MsgType.GET_STATUS,
         )
-        return reply is not None and reply.msg_type == MsgType.GET_STATUS
+        if reply is not None and reply.msg_type == MsgType.GET_STATUS:
+            self._available = True
+            return True
+        return False
 
     # ========= Internal helpers (connection / lifecycle) =========
     async def _cleanup_connection(self) -> None:
+        """Clean up connection resources without stopping background tasks."""
         self._connected = False
         self._available = False
 
-        # Cancel & await all registered tasks
-        if self._tasks:
-            _, pending = await asyncio.wait([*self._tasks], timeout=10)
-            for task in pending:
-                task.cancel()
-
-        # Close writer
+        # Close writer but don't cancel background tasks
         if self._writer:
             try:
                 self._writer.close()
@@ -272,24 +267,28 @@ class GatewayNode:
         self._writer = None
         self._reader = None
 
-    async def _handle_reconnect(self) -> None:
+    async def _handle_reconnect(self) -> bool:
         """Handle reconnection logic."""
         if self._stop_event.is_set() or not self.auto_reconnect:
-            return
-        logger.info("🔄 Attempting to reconnect to gateway...")
-        await self._cleanup_connection()
+            return False
+
+        logger.info("Attempting to reconnect to gateway...")
+        self._connected = False
+
         try:
             await self.connect()
         except (GatewayConnectionError, GatewayNotAvailable) as e:
-            logger.error("❌ Failed to reconnect: %s", e)
+            logger.error("Failed to reconnect: %s", e)
+            return False
+        return True
 
     # --------- Listener and response routing ---------
     async def _listen_for_responses(self) -> None:
         """Continuously read framed messages and route them."""
-        logger.debug("📡 Starting to listen for responses (async)...")
+        logger.debug("Starting to listen for responses (async)...")
         buffer = bytearray()
         try:
-            while not self._stop_event.is_set() and self._connected:
+            while not self._stop_event.is_set():
                 if not self._reader:
                     await asyncio.sleep(0.1)
                     continue
@@ -310,7 +309,7 @@ class GatewayNode:
                     logger.warning("📡 Connection closed by gateway or empty read")
                     await self._handle_reconnect()
                     continue
-
+                self._available = True  # mark available on any incoming data
                 buffer.extend(chunk)
                 # Frame extraction loop based on first length byte
                 while True:
@@ -322,7 +321,7 @@ class GatewayNode:
                     packet = bytes(buffer[:total_len])
                     del buffer[:total_len]
                     logger.debug(
-                        "📨 Received %d bytes: %s", len(packet), packet.hex(" ").upper()
+                        "Received %d bytes: %s", len(packet), packet.hex(" ").upper()
                     )
                     try:
                         self._handle_response(packet)
@@ -330,13 +329,13 @@ class GatewayNode:
                         logger.error("Error handling response: %s", e)
         finally:
             self._connected = False
-            logger.debug("🔇 Async response listening stopped")
+            logger.debug("Async response listening stopped")
 
     def _handle_response(self, data: bytes) -> None:
         """Handle the received response message."""
         try:
             msg = Message.from_bytes(data)
-        except Exception as e:  # pylint: disable=broad-except
+        except ValueError as e:
             logger.warning("Failed to decode message (%d bytes): %s", len(data), e)
             return
 
@@ -349,6 +348,7 @@ class GatewayNode:
                 return
             # attach lock to message
             msg.lock = lock
+            msg.lock.last_message = msg
             # update lock live status if present
             if msg.live_status:
                 lock.update_status(msg.live_status)
@@ -390,25 +390,15 @@ class GatewayNode:
                     "RESPONSE failed: code: %s, data: %s", resp.code, resp.data
                 )
 
-        # 3) ANSWER messages (via ref_id_type)
-        # elif msg.ref_id_type == ReferenceType.ANSWER:
-        #     # Gateway GET_STATUS answer: mark availability
-        #     if (
-        #         msg.device_address == self.address
-        #         and msg.msg_type == MsgType.GET_STATUS
-        #     ):
-        #         self._available = True
-
         self._current_request.response_message = msg
         self._current_request.response_event.set()
         logger.debug(
-            "📬 Delivered ANSWER to waiting command %s (ref=0x%02X)",
+            "Delivered ANSWER to waiting command %s (ref=0x%02X)",
             self._current_request.message.msg_type.name,
             self._current_request.message.ref_id,
         )
 
     async def _send_bytes(self, message: bytes) -> None:
-        # --------- Sending and command queue ---------
         """Send message to gateway."""
         async with self._send_lock:
             if not self._connected or not self._writer:
@@ -423,6 +413,8 @@ class GatewayNode:
                 )
             except Exception as e:  # pylint: disable=broad-except
                 logger.error("Send failed: %s", e)
+                # Mark as disconnected so reconnect logic can handle it
+                self._connected = False
                 raise GatewayConnectionError(f"Failed to send command: {e}") from e
 
     async def _resend_last_message(self, new_sequence: int) -> None:
@@ -440,7 +432,7 @@ class GatewayNode:
         await self._send_bytes(self._last_message.to_bytes())
 
     async def _process_commands(self) -> None:
-        logger.debug("🔄 Async command processor started")
+        logger.debug("Async command processor started")
         try:
             while not self._stop_event.is_set():
                 try:
@@ -454,7 +446,7 @@ class GatewayNode:
                     self._current_request = request
 
                 logger.debug(
-                    "📤 Processing command %s for device %08X (ref_id=0x%02X)",
+                    "Processing command %s for device %08X (ref_id=0x%02X)",
                     request.message.msg_type.name,
                     request.message.device_address,
                     request.message.ref_id,
@@ -466,7 +458,7 @@ class GatewayNode:
                     attempt += 1
                     try:
                         logger.debug(
-                            "➡️  Attempt %d/%d for ref_id=0x%02X",
+                            "Attempt %d/%d for ref_id=0x%02X",
                             attempt,
                             max_attempts,
                             request.message.ref_id,
@@ -474,13 +466,22 @@ class GatewayNode:
                         await self._send_message(request)
                     except GatewayConnectionError as e:
                         logger.warning(
-                            "Send failed due to connection error for ref_id=0x%02X: %s — aborting command retries",
+                            "Send failed due to connection error for ref_id=0x%02X: %s — triggering reconnect",
                             request.message.ref_id,
                             e,
                         )
-                        request.response_message = None
-                        request.response_event.set()
-                        break
+                        # Trigger reconnection
+                        if not await self._handle_reconnect():
+                            # If we're still not connected after reconnect, continue to next attempt
+                            logger.warning(
+                                "Reconnect failed for ref_id=0x%02X, will retry",
+                                request.message.ref_id,
+                            )
+                            request.response_message = None
+                            request.response_event.set()
+                            break
+                        # If reconnect succeeded, continue with normal retry logic
+                        continue
 
                     try:
                         await asyncio.wait_for(
@@ -490,14 +491,14 @@ class GatewayNode:
                     except asyncio.TimeoutError:
                         if attempt < max_attempts:
                             logger.warning(
-                                "⏰ Command timeout (attempt %d/%d) for ref_id=0x%02X — retrying",
+                                "Command timeout (attempt %d/%d) for ref_id=0x%02X — retrying",
                                 attempt,
                                 max_attempts,
                                 request.message.ref_id,
                             )
                             continue
                         logger.warning(
-                            "⏰ Command timeout (final attempt %d/%d) for ref_id=0x%02X — giving up",
+                            "Command timeout (final attempt %d/%d) for ref_id=0x%02X — giving up",
                             attempt,
                             max_attempts,
                             request.message.ref_id,
@@ -516,9 +517,9 @@ class GatewayNode:
         except asyncio.CancelledError:
             pass
         except Exception as e:  # pylint: disable=broad-except
-            logger.error("💥 Error in async command processor: %s", e)
+            logger.error("Error in async command processor: %s", e)
         finally:
-            logger.debug("🔄 Async command processor stopped")
+            logger.debug("Async command processor stopped")
 
     async def _send_message(self, request: MessageRequest) -> None:
         """Send message to gateway."""

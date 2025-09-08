@@ -29,6 +29,15 @@ class BatteryStatus(Enum):
     MEDIUM = 2
     FULL = 3
 
+    def __str__(self) -> str:
+        mapping = {
+            BatteryStatus.UNKNOWN: "unknown",
+            BatteryStatus.LOW: "low",
+            BatteryStatus.MEDIUM: "medium",
+            BatteryStatus.FULL: "full",
+        }
+        return mapping[self]
+
 
 class QosLevel(Enum):
     """Quality of Service levels based on live status bits"""
@@ -181,8 +190,6 @@ class Lock:
             MsgType.SHORT_TERM_ACTIVATION, msg_data, card_read_response
         ):
             resp = Response.from_message(reply)
-            if resp.success:
-                await self.get_status()
             return resp.success
         return False
 
@@ -190,14 +197,11 @@ class Lock:
         self, delay: int = 0, duration: int = 0, card_read_response=False
     ) -> bool:
         """Async: Activate device for long term and wait for response."""
-        if self.lock_state == LockState.ENGAGED:
-            logger.warning("Lock is already engaged, cannot long term activate")
-            return False
         if delay > 1440:
             raise ValueError("delay must be in range 0..1440 (minutes)")
         if duration > 1440:
             raise ValueError("duration must be in range 0..1440 (minutes)")
-        msg_data = struct.pack(">HH", delay, duration)
+        msg_data = struct.pack("<HH", delay, duration)
         if reply := await self._send_and_wait(
             MsgType.LONG_TERM_ACTIVATION, msg_data, card_read_response
         ):
@@ -206,8 +210,6 @@ class Lock:
                 logger.warning(
                     "Long term activation failed, lock is already activated or a card read response was expected."
                 )
-            if resp.success:
-                await self.get_status()
             return resp.success
         return False
 

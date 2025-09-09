@@ -389,6 +389,7 @@ class ResponseCode(int, Enum):
     FAILED = 0x01
     UNEXPECTED = 0x0A
     SEQUENCE_MISMATCH = 0x07
+    COMM_TIMEOUT = 0x12
     # Other codes can be added here as they are discovered
 
 

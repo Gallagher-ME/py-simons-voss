@@ -234,10 +234,10 @@ class GatewayNode:
         )
         return None
 
-    def add_lock(self, device_address: Union[int, str]) -> Lock:
+    def add_lock(self, device_address: Union[int, str], name: str = "") -> Lock:
         """Register a lock on this gateway and return it."""
         lock_address = normalize_address(device_address)
-        self.locks[lock_address] = lock = Lock(self, lock_address)
+        self.locks[lock_address] = lock = Lock(self, lock_address, name=name)
         return lock
 
     async def get_status(self) -> bool:

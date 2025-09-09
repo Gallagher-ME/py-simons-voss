@@ -72,7 +72,7 @@ class Lock:
         # Send command_data through your socket connection
     """
 
-    def __init__(self, client: GatewayNode, address: int) -> None:
+    def __init__(self, client: GatewayNode, address: int, name: str = "") -> None:
         """
         Initialize the lock command builder.
 
@@ -83,6 +83,7 @@ class Lock:
         # Back-reference to a client for auto-sending commands and routing
         self._client = client
         self.address = address
+        self._name = name
 
         # Last received decoded message for this device (if any)
         self.last_message: Message | None = None
@@ -94,6 +95,11 @@ class Lock:
         self.lock_tampered = False
 
         logger.debug("Initialized device %08X", address)
+
+    @property
+    def name(self) -> str:
+        """Return the device name."""
+        return self._name
 
     async def _send_and_wait(
         self,
